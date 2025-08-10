@@ -1,0 +1,19 @@
+.env
+*env
+
+# Środowisko wirtualne Python
+venv/
+.venv/
+
+# Pliki cache i skompilowane Pythona
+__pycache__/
+*.pyc
+
+# Pliki cache IDE (np. VS Code)
+.vscode/
+
+# Pliki cache z testów (np. pytest)
+.pytest_cache/
+
+# Pliki systemowe macOS
+.DS_Store

@@ -1,0 +1,28 @@
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    TOKENIZERS_PARALLELISM=false \
+    HF_HOME=/models/.cache \
+    TRANSFORMERS_CACHE=/models/.cache \
+    # (opcjonalnie lepsza alokacja pamięci dla torch)
+    PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
+
+RUN apt-get update && apt-get install -y python3 python3-pip && rm -rf /var/lib/apt/lists/*
+RUN python3 -m pip install --no-cache-dir --upgrade pip
+RUN pip3 install torch --index-url https://download.pytorch.org/whl/cu126
+
+# RUN python -m pip install fastapi uvicorn[standard] transformers accelerate bitsandbytes sentencepiece
+
+WORKDIR /app
+
+# zależności (w req masz m.in. torch, transformers, bitsandbytes, hf_transfer, dotenv)
+COPY requirements.txt /app/requirements.txt
+RUN pip3 install --no-cache-dir -r /app/requirements.txt
+
+# aplikacja – tu zakładam, że TWÓJ plik to main.py i ma już obsługę ENV
+COPY main.py /app/main.py
+
+EXPOSE 8000
+# 1 worker, bo 1 proces trzyma model w VRAM
+CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8000","--workers","1","--timeout-keep-alive","75"]
