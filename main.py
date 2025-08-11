@@ -40,6 +40,10 @@ USE_FAST_TOKENIZER = env_bool("USE_FAST_TOKENIZER", True)
 MAX_TOKENS = int(os.getenv("MAX_GENERATION_TOKENS", "1024"))
 TRUST_REMOTE_CODE = env_bool("TRUST_REMOTE_CODE", True)
 
+DO_SAMPLE = env_bool("DO_SAMPLE", True)                  # np. DO_SAMPLE=false dla ekstrakcji
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.4"))     # np. TEMPERATURE=0.0
+TOP_K = int(os.getenv("TOP_K", "50"))  
+
 DEFAULT_SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT", "Jesteś pomocnym asystentem. Odpowiadaj po polsku."
 )
@@ -210,9 +214,9 @@ async def generate_response(req: PromptRequest):
         out_ids = mdl.generate(
             input_ids,
             max_new_tokens=max_new,
-            temperature=0.4,
-            do_sample=True,
-            top_k=50,
+            temperature=TEMPERATURE,
+            do_sample=DO_SAMPLE,
+            top_k=TOP_K,
             eos_token_id=eos_id,
             pad_token_id=pad_id,
         )
