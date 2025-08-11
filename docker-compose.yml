@@ -1,8 +1,5 @@
 services:
   llm:
-    build:
-      context: .
-      dockerfile: Dockerfile
     image: szemil99/llm-app:latest
     container_name: llm-api
     ports: ['8000:8000']
@@ -10,13 +7,7 @@ services:
       - .env
     volumes:
       - models:/models # named volume, łatwe sprzątanie per projekt (-p)
-    deploy: # Zaktualizowana sekcja dla GPU
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    gpus: all
     restart: unless-stopped
 
 volumes:
