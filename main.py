@@ -150,9 +150,9 @@ async def healthz():
     ok = ("model" in model_pipeline) and ("tokenizer" in model_pipeline)
     return {"ok": ok, "model": MODEL_NAME}
 
-
 @app.post("/chat", response_model=ChatResponse)
 async def generate_response(req: PromptRequest):
+    # 0) sanity-check: czy model/tokenizer są załadowane
     if "model" not in model_pipeline or "tokenizer" not in model_pipeline:
         raise HTTPException(
             status_code=503,
@@ -163,56 +163,66 @@ async def generate_response(req: PromptRequest):
     tok = model_pipeline["tokenizer"]
     mdl = model_pipeline["model"]
 
-    # 1) budowa listy wiadomości (DeepSeek-R1 bez system promptu)
+    # 1) Zbuduj wiadomości (DeepSeek-R1 bez system promptu)
+    user_text = (req.prompt or "").strip()
+    if not user_text:
+        raise HTTPException(status_code=400, detail="Pusty prompt.")
+
     messages = [
         {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
-        {"role": "user", "content": req.prompt.strip()},
+        {"role": "user",   "content": user_text},
     ]
     if MODEL_NAME.lower().startswith("deepseek-ai/deepseek-r1-distill-"):
-        messages = [{"role": "user", "content": req.prompt.strip()}]
+        messages = [{"role": "user", "content": user_text}]
 
-    # 2) render szablonu: preferuj apply_chat_template, inaczej fallback
+    # 2) Render czatu -> preferuj chat_template; fallback: ręczny prompt
+    input_ids = None
     try:
+        # apply_chat_template zwraca TENSOR (gdy return_tensors="pt")
         input_ids = tok.apply_chat_template(
             messages, add_generation_prompt=True, return_tensors="pt"
         ).to(mdl.device)
     except Exception as e:
         print(f"[WARN] Brak/nieudany chat_template ({e}). Fallback na prosty prompt.")
-        prompt_text = (
-            f"<|im_start|>user\n{req.prompt.strip()}<|im_end|>\n<|im_start|>assistant\n"
-        )
-        input_ids = tok(prompt_text, return_tensors="pt").to(mdl.device)
+        # Minimalny, neutralny format zgodny z większością nowszych modeli
+        prompt_text = f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n"
+        enc = tok(prompt_text, return_tensors="pt")
+        input_ids = enc["input_ids"].to(mdl.device)  # WYCIĄGNIJ TENSOR
 
-    # 3) eos/pad (Llama-3 ma <|eot_id|>)
-    eot_id = (
-        tok.convert_tokens_to_ids("<|eot_id|>")
-        if "<|eot_id|>" in tok.get_vocab()
-        else None
-    )
-    eos_id = (
-        eot_id
-        if eot_id is not None
-        else (tok.eos_token_id if tok.eos_token_id is not None else None)
-    )
-    pad_id = tok.pad_token_id if tok.pad_token_id is not None else eos_id
+    # 3) Ustal eos/pad
+    # Spróbuj użyć <|eot_id|> jeśli istnieje i nie mapuje się na unk
+    eot_id = tok.convert_tokens_to_ids("<|eot_id|>")
+    if isinstance(eot_id, int) and tok.unk_token_id is not None and eot_id != tok.unk_token_id:
+        eos_id = eot_id
+    else:
+        eos_id = tok.eos_token_id
 
-    # 4) generacja „nowych” tokenów
+    # Ustaw pad_token jeśli brak — najsensowniej na EOS
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token or tok.unk_token
+    pad_id = tok.pad_token_id
+
+    max_new = int(MAX_TOKENS) if MAX_TOKENS and int(MAX_TOKENS) > 0 else 512
+
+    # 4) Generacja (bez attention_mask też zadziała, ale można dodać jeśli masz w enc)
     pre_len = input_ids.shape[1]
-    out_ids = mdl.generate(
-        input_ids,
-        max_new_tokens=MAX_TOKENS,
-        temperature=0.4,
-        do_sample=True,
-        top_k=50,
-        eos_token_id=eos_id,
-        pad_token_id=pad_id,
-    )
+    with torch.no_grad():
+        out_ids = mdl.generate(
+            input_ids,
+            max_new_tokens=max_new,
+            temperature=0.4,
+            do_sample=True,
+            top_k=50,
+            eos_token_id=eos_id,
+            pad_token_id=pad_id,
+        )
+
     new_tokens = out_ids[0, pre_len:]
-    response_text = tok.decode(new_tokens, skip_special_tokens=True)
+    response_text = tok.decode(new_tokens, skip_special_tokens=True).strip()
 
     ms = round((time.perf_counter() - start) * 1000)
     return {
         "message_id": str(uuid.uuid4()),
-        "messages": [{"id": str(uuid.uuid4()), "content": response_text.strip()}],
+        "messages": [{"id": str(uuid.uuid4()), "content": response_text}],
         "statistics": {"processingTimeMs": ms},
     }
