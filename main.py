@@ -40,9 +40,9 @@ USE_FAST_TOKENIZER = env_bool("USE_FAST_TOKENIZER", True)
 MAX_TOKENS = int(os.getenv("MAX_GENERATION_TOKENS", "1024"))
 TRUST_REMOTE_CODE = env_bool("TRUST_REMOTE_CODE", True)
 
-DO_SAMPLE = env_bool("DO_SAMPLE", True)                  # np. DO_SAMPLE=false dla ekstrakcji
-TEMPERATURE = float(os.getenv("TEMPERATURE", "0.4"))     # np. TEMPERATURE=0.0
-TOP_K = int(os.getenv("TOP_K", "50"))  
+DO_SAMPLE = env_bool("DO_SAMPLE", True)  # np. DO_SAMPLE=false dla ekstrakcji
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.4"))  # np. TEMPERATURE=0.0
+TOP_K = int(os.getenv("TOP_K", "50"))
 
 DEFAULT_SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT", "Jesteś pomocnym asystentem. Odpowiadaj po polsku."
@@ -101,7 +101,10 @@ async def lifespan(app: FastAPI):
     print("[BOOT] Ładowanie tokenizera...")
     try:
         tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_NAME, use_fast=USE_FAST_TOKENIZER, token=token, trust_remote_code=TRUST_REMOTE_CODE
+            MODEL_NAME,
+            use_fast=USE_FAST_TOKENIZER,
+            token=token,
+            trust_remote_code=TRUST_REMOTE_CODE,
         )
     except Exception as e:
         print(f"[WARN] Fast tokenizer nie działa ({e}). Fallback na slow.")
@@ -154,6 +157,7 @@ async def healthz():
     ok = ("model" in model_pipeline) and ("tokenizer" in model_pipeline)
     return {"ok": ok, "model": MODEL_NAME}
 
+
 @app.post("/chat", response_model=ChatResponse)
 async def generate_response(req: PromptRequest):
     # 0) sanity-check: czy model/tokenizer są załadowane
@@ -167,59 +171,67 @@ async def generate_response(req: PromptRequest):
     tok = model_pipeline["tokenizer"]
     mdl = model_pipeline["model"]
 
-    # 1) Zbuduj wiadomości (DeepSeek-R1 bez system promptu)
+    # 1) Wiadomości (DeepSeek-R1 bez system promptu)
     user_text = (req.prompt or "").strip()
     if not user_text:
         raise HTTPException(status_code=400, detail="Pusty prompt.")
 
     messages = [
         {"role": "system", "content": DEFAULT_SYSTEM_PROMPT},
-        {"role": "user",   "content": user_text},
+        {"role": "user", "content": user_text},
     ]
     if MODEL_NAME.lower().startswith("deepseek-ai/deepseek-r1-distill-"):
         messages = [{"role": "user", "content": user_text}]
 
-    # 2) Render czatu -> preferuj chat_template; fallback: ręczny prompt
-    input_ids = None
+    # 2) Render czatu -> STRING, potem tokenizacja (żeby mieć attention_mask)
     try:
-        # apply_chat_template zwraca TENSOR (gdy return_tensors="pt")
-        input_ids = tok.apply_chat_template(
-            messages, add_generation_prompt=True, return_tensors="pt"
-        ).to(mdl.device)
+        rendered = tok.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=False,  # zwróci string
+        )
     except Exception as e:
-        print(f"[WARN] Brak/nieudany chat_template ({e}). Fallback na prosty prompt.")
-        # Minimalny, neutralny format zgodny z większością nowszych modeli
-        prompt_text = f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n"
-        enc = tok(prompt_text, return_tensors="pt")
-        input_ids = enc["input_ids"].to(mdl.device)  # WYCIĄGNIJ TENSOR
+        print(f"[WARN] chat_template failed ({e}). Fallback prompt.")
+        rendered = f"<|im_start|>user\n{user_text}<|im_end|>\n<|im_start|>assistant\n"
+
+    enc = tok(rendered, return_tensors="pt", add_special_tokens=False)
+    input_ids = enc["input_ids"].to(mdl.device)
+    attention_mask = enc["attention_mask"].to(mdl.device)
 
     # 3) Ustal eos/pad
-    # Spróbuj użyć <|eot_id|> jeśli istnieje i nie mapuje się na unk
     eot_id = tok.convert_tokens_to_ids("<|eot_id|>")
-    if isinstance(eot_id, int) and tok.unk_token_id is not None and eot_id != tok.unk_token_id:
+    if (
+        isinstance(eot_id, int)
+        and tok.unk_token_id is not None
+        and eot_id != tok.unk_token_id
+    ):
         eos_id = eot_id
     else:
         eos_id = tok.eos_token_id
 
-    # Ustaw pad_token jeśli brak — najsensowniej na EOS
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token or tok.unk_token
     pad_id = tok.pad_token_id
 
     max_new = int(MAX_TOKENS) if MAX_TOKENS and int(MAX_TOKENS) > 0 else 512
 
-    # 4) Generacja (bez attention_mask też zadziała, ale można dodać jeśli masz w enc)
+    USE_CACHE_ENV = os.getenv("USE_CACHE", "1").lower() in ("1","true","yes","y","on")
+
+    # 4) Generacja (temperaturę/top_k podawaj tylko przy sampling)
+    gen_kwargs = dict(
+        max_new_tokens=max_new,
+        eos_token_id=eos_id,
+        pad_token_id=pad_id,
+        attention_mask=attention_mask,
+        do_sample=DO_SAMPLE,
+        use_cache=USE_CACHE_ENV,  # z przypiętym Transformers 4.44.2 działa poprawnie
+    )
+    if DO_SAMPLE:
+        gen_kwargs.update(dict(temperature=TEMPERATURE, top_k=TOP_K))
+
     pre_len = input_ids.shape[1]
-    with torch.no_grad():
-        out_ids = mdl.generate(
-            input_ids,
-            max_new_tokens=max_new,
-            temperature=TEMPERATURE,
-            do_sample=DO_SAMPLE,
-            top_k=TOP_K,
-            eos_token_id=eos_id,
-            pad_token_id=pad_id,
-        )
+    with torch.inference_mode():
+        out_ids = mdl.generate(input_ids, **gen_kwargs)
 
     new_tokens = out_ids[0, pre_len:]
     response_text = tok.decode(new_tokens, skip_special_tokens=True).strip()
